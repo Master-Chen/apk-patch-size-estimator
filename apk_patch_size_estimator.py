@@ -41,7 +41,7 @@ gzip_path = None
 head_path = None
 tail_path = None
 bunzip2_path = None
-
+java_path = None
 
 def find_bins_or_die():
   """Checks that all the binaries needed are available.
@@ -65,6 +65,9 @@ def find_bins_or_die():
   global bunzip2_path
   if not bunzip2_path:
     bunzip2_path = find_binary('bunzip2')
+  global java_path
+  if not java_path:
+    java_path = find_binary('java')
 
 
 def find_binary(binary_name):
@@ -89,9 +92,9 @@ def human_file_size(size):
 
 
 def calculate_sizes(old_file, new_file, save_patch_path, temp_path):
-  """Estimates the size of a Google Play patch and the new gzipped APK.
+  """Estimates the size of Google Play patches and the new gzipped APK.
 
-  From two APK files it estimates the size of a Google Play patch and
+  From two APK files it estimates the sizes of a Google Play patches and
   the size of the new gzipped APK.
 
   Args:
@@ -113,7 +116,6 @@ def calculate_sizes(old_file, new_file, save_patch_path, temp_path):
   # Bsdiff forces bzip2 compression, which starts after byte 32. Bzip2 isn't
   # necessarily the best choice in all cases, and isn't necessarily what Google
   # Play uses, so it has to be uncompressed and rewritten with gzip.
-  if os.path.exists(temp_path + '.gz'): os.remove(temp_path + '.gz')
   if os.path.exists(temp_path): os.remove(temp_path)
 
   # Checks that the OS binaries needed are available
@@ -123,6 +125,7 @@ def calculate_sizes(old_file, new_file, save_patch_path, temp_path):
   subprocess.check_output(
       [bsdiff_path, old_file, new_file, temp_path])
 
+  # bsdiff paths
   raw_bsdiff_path = temp_path + '.raw_bsdiff'
   bzipped_bsdiff_path = raw_bsdiff_path + '.bz2'
   gzipped_bsdiff_path = raw_bsdiff_path + '.gz'
@@ -177,17 +180,7 @@ def calculate_sizes(old_file, new_file, save_patch_path, temp_path):
   subprocess.check_output([gzip_path, '-9', rebuilt_bsdiff_path])
   bsdiff_patch_size = os.stat(rebuilt_bsdiff_path + '.gz').st_size
 
-  # gzip new APK and get its size.
-  gzipped_new_file = open(temp_path, 'w')
-  p = subprocess.Popen(
-      [gzip_path, '--keep', '-c', '-9', new_file],
-      shell=False, stdout=gzipped_new_file)
-  ret_code = p.wait()
-  if ret_code != 0: raise Exception(
-      'Problem gzipping the new APK, returned code: %s' % ret_code)
-  gzipped_new_file.flush()
-  gzipped_new_file.close()
-  gzipped_new_file_size = os.stat(temp_path).st_size
+  gzipped_new_file_size = calculate_new_apk(new_file, temp_path)
 
   # Clean up.
   if os.path.exists(temp_path): os.remove(temp_path)
@@ -197,7 +190,43 @@ def calculate_sizes(old_file, new_file, save_patch_path, temp_path):
           'bsdiff_patch_size': bsdiff_patch_size}
 
 
+def calculate_new_apk(new_file, temp_path):
+  if os.path.exists(temp_path + '.gz'): os.remove(temp_path + '.gz')
+  # gzip new APK and get its size
+  gzipped_new_file = open(temp_path, 'w')
+  p = subprocess.Popen(
+      [gzip_path, '--keep', '-c', '-9', new_file],
+      shell=False, stdout=gzipped_new_file)
+  ret_code = p.wait()
+  if ret_code != 0: raise Exception(
+      'Problem gzipping the new APK, returned code: %s' % ret_code)
+  gzipped_new_file.flush()
+  gzipped_new_file.close()
+  return os.stat(temp_path).st_size
+
+
+def calculate_filebyfile(old_file, new_file, save_patch_path, temp_path):
+  filebyfile_patch_path = temp_path + '.filebyfile'
+  if os.path.exists(filebyfile_patch_path + '.gz'): os.remove(filebyfile_patch_path + '.gz')
+  # file by file patch
+  # We use a jar from https://github.com/andrewhayden/archive-patcher
+  if os.path.exists(filebyfile_patch_path): os.remove(filebyfile_patch_path)
+  p = subprocess.Popen(
+      [java_path, '-jar', 'lib/file-by-file-tools.jar', '--generate', '--old', old_file,
+      '--new', new_file, '--patch', filebyfile_patch_path], shell=False)
+  ret_code = p.wait()
+  if ret_code != 0: raise Exception(
+      'Problem creating file by file patch, returned code: %s' % ret_code)
+
+  # gzip file by file patch and get its size
+  subprocess.check_output([gzip_path, '-9', filebyfile_patch_path])
+  gzipped_filebyfile_patch_size = os.stat(filebyfile_patch_path + '.gz').st_size
+  return gzipped_filebyfile_patch_size;
+
+
 def main():
+  locale.setlocale(locale.LC_ALL, '')
+
   parser = argparse.ArgumentParser(
       description='Estimate the size of an APK patch for Google Play')
   parser.add_argument(
@@ -232,25 +261,36 @@ def main():
     raise Exception('Temp directory does not exist: %s' % args.temp_dir)
   temp_path = args.temp_dir + '/patch.tmp'
 
+  new_file_size = os.stat(args.new_file).st_size
+
   sizes = calculate_sizes(
       args.old_file, args.new_file, save_patch_path, temp_path)
-  new_file_size = os.stat(args.new_file).st_size
   gzipped_size = sizes['gzipped_new_file_size']
   bsdiff_size = sizes['bsdiff_patch_size']
 
-  locale.setlocale(locale.LC_ALL, '')
-  print 'Estimates:'
-  print ('New APK size on Disk: %s bytes [%s]'
+  # Calculate the size of the File-by-File patch gzipped
+  gzipped_filebyfile_patch_size = calculate_filebyfile(
+      args.old_file, args.new_file, save_patch_path, temp_path)
+ 
+  print ('\nNew APK size on disk: %s bytes [%s]'
          % (locale.format('%d', new_file_size, grouping=True),
             human_file_size(new_file_size)))
-  print ('New APK Gzipped size (== Download size for new installs):'
+
+  print '\nEstimated download size for new installs:'
+  print ('   Full new APK (gzipped) size:'
          ' %s bytes [%s]'
          % (locale.format('%d', gzipped_size, grouping=True),
             human_file_size(gzipped_size)))
-  print ('Gzipped Bsdiff Patch Size '
-         '(== Download size for updates from the old APK): %s bytes [%s]'
+
+  print '\nEstimated download size for updates from the old APK, using Bsdiff:'
+  print ('   Bsdiff patch (gzipped) size: %s bytes [%s]'
          % (locale.format('%d', bsdiff_size, grouping=True),
             human_file_size(bsdiff_size)))
+
+  print '\nEstimated download size for updates from the old APK, using File-by-File:'
+  print ('   File-by-File patch (gzipped) size: %s bytes [%s]\n'
+         % (locale.format('%d', gzipped_filebyfile_patch_size, grouping=True),
+            human_file_size(gzipped_filebyfile_patch_size)))
 
 
 if __name__ == '__main__':
